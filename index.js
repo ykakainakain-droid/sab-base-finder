@@ -21,19 +21,21 @@ client.on('messageCreate', async (message) => {
   if (message.content.startsWith('!basefind')) {
     const args = message.content.split(' ').slice(1);
     if (args.length < 3) {
-      return message.reply('❌ Usage: `!basefind <rate> <owner> <unlock_time> <server_link>`\n📌 Example: `!basefind 4700000 Heisenberg27 34s https://roblox.com/games/...`');
+      return message.reply('❌ Usage: `!basefind <rate> <owner> <unlocktime> <link> <brainrotname>`\n📌 Example: `!basefind 4700000 Heisenberg27 34s https://roblox.com/games/... Skibidi`');
     }
 
     const rate = args[0];
     const owner = args[1];
     const unlock = args[2];
     const serverLink = args[3];
+    const brainrot = args[4];
 
     const embed = new EmbedBuilder()
       .setTitle('🌟 Base Found!')
       .setColor(0x00ff00)
       .setDescription(serverLink ? `[🔗 Click here to join the server](${serverLink})` : null)
       .addFields(
+        ...(brainrot ? [{ name: '🧠 Brainrot', value: brainrot, inline: true }] : []),
         { name: '💰 Rate', value: `$${rate}/s`, inline: true },
         { name: '👤 Owner', value: owner, inline: true },
         { name: '⏱️ Unlocks', value: unlock, inline: true },
