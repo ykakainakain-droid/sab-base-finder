@@ -5,7 +5,8 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers
   ]
 });
 
@@ -49,6 +50,42 @@ client.on('messageCreate', async (message) => {
       await channel.send({ embeds: [embed] });
     }));
     message.reply('✅ Base reported!');
+  }
+
+  if (message.content.startsWith('+ban')) {
+    if (!message.member.permissions.has('BanMembers')) {
+      return message.reply('❌ You do not have permission to ban members.');
+    }
+    const target = message.mentions.members.first();
+    if (!target) return message.reply('❌ Usage: `+ban @user [reason]`');
+    const reason = message.content.split(' ').slice(2).join(' ') || 'No reason provided';
+    await target.ban({ reason });
+    message.reply(`✅ Banned **${target.user.tag}** — Reason: ${reason}`);
+  }
+
+  if (message.content.startsWith('+kick')) {
+    if (!message.member.permissions.has('KickMembers')) {
+      return message.reply('❌ You do not have permission to kick members.');
+    }
+    const target = message.mentions.members.first();
+    if (!target) return message.reply('❌ Usage: `+kick @user [reason]`');
+    const reason = message.content.split(' ').slice(2).join(' ') || 'No reason provided';
+    await target.kick(reason);
+    message.reply(`✅ Kicked **${target.user.tag}** — Reason: ${reason}`);
+  }
+
+  if (message.content.startsWith('+mute')) {
+    if (!message.member.permissions.has('ModerateMembers')) {
+      return message.reply('❌ You do not have permission to mute members.');
+    }
+    const target = message.mentions.members.first();
+    if (!target) return message.reply('❌ Usage: `+mute @user <duration in minutes> [reason]`');
+    const args = message.content.split(' ').slice(2);
+    const duration = parseInt(args[0]);
+    if (isNaN(duration) || duration <= 0) return message.reply('❌ Please provide a valid duration in minutes.');
+    const reason = args.slice(1).join(' ') || 'No reason provided';
+    await target.timeout(duration * 60 * 1000, reason);
+    message.reply(`✅ Muted **${target.user.tag}** for **${duration} minute(s)** — Reason: ${reason}`);
   }
 });
 
