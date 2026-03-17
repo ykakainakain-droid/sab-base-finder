@@ -153,11 +153,14 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.customId.startsWith('genter_')) {
     const messageId = interaction.customId.replace('genter_', '');
     const gw = giveaways.get(messageId);
-    if (!gw) return interaction.reply({ content: '❌ This giveaway has already ended.', ephemeral: true });
+
+    if (!gw) {
+      const ended = endedGiveaways.has(messageId);
+      return interaction.reply({ flags: 64, content: ended ? '❌ This giveaway has already ended.' : '❌ This giveaway is no longer active.' });
+    }
 
     if (gw.entries.has(interaction.user.id)) {
-      gw.entries.delete(interaction.user.id);
-      await interaction.reply({ content: '❌ You left the giveaway.', ephemeral: true });
+      return interaction.reply({ flags: 64, content: '❌ You have already entered this giveaway!' });
     } else {
       // Determine entry count: highest matching bonus role wins, default is 1
       const member = interaction.member;
@@ -169,7 +172,7 @@ client.on('interactionCreate', async (interaction) => {
       }
       gw.entries.set(interaction.user.id, entryCount);
       const bonusMsg = entryCount > 1 ? ` You have **${entryCount}x entries** thanks to your role bonus!` : '';
-      await interaction.reply({ content: `✅ You entered the giveaway! Good luck!${bonusMsg}`, ephemeral: true });
+      await interaction.reply({ flags: 64, content: `✅ You entered the giveaway! Good luck!${bonusMsg}` });
     }
 
     saveGiveaways();
