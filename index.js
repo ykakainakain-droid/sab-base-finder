@@ -12,9 +12,9 @@ const client = new Client({
 
 const CHANNEL_IDS = ['1482822474449162370', '1472417066442293331'];
 
-// Active giveaways: messageId -> { entries, winners, prize, endTime, channelId, timer }
+// Active giveaways: messageId -> { entries: Map<userId, entryCount>, bonusRoles: Map<roleId, entryCount>, winners, prize, endTime, channelId, timer }
 const giveaways = new Map();
-// Ended giveaways (kept for reroll): messageId -> { entries, prize, winners }
+// Ended giveaways (kept for reroll): messageId -> { pool: userId[], prize, winners }
 const endedGiveaways = new Map();
 
 // --- Helpers ---
@@ -22,10 +22,15 @@ const endedGiveaways = new Map();
 const modEmbed = (title, description, color) =>
   new EmbedBuilder().setTitle(title).setDescription(description).setColor(color).setTimestamp();
 
-function buildGiveawayEmbed(prize, winnersCount, endTime, entryCount = 0) {
+function buildGiveawayEmbed(prize, winnersCount, endTime, entryCount = 0, bonusRoles = new Map()) {
+  let desc = `Click 🎉 to enter!\n\n**Winners:** ${winnersCount}\n**Ends:** <t:${Math.floor(endTime / 1000)}:R>`;
+  if (bonusRoles.size > 0) {
+    const bonusLines = [...bonusRoles.entries()].map(([roleId, count]) => `<@&${roleId}> — **${count}x entries**`).join('\n');
+    desc += `\n\n🌟 **Bonus Entries:**\n${bonusLines}`;
+  }
   return new EmbedBuilder()
     .setTitle(`🎉 ${prize}`)
-    .setDescription(`Click 🎉 to enter!\n\n**Winners:** ${winnersCount}\n**Ends:** <t:${Math.floor(endTime / 1000)}:R>`)
+    .setDescription(desc)
     .setColor(0xff6600)
     .setFooter({ text: `${entryCount} participant(s)` })
     .setTimestamp(new Date(endTime));
@@ -51,13 +56,16 @@ async function endGiveaway(messageId, channelId) {
 
   clearTimeout(gw.timer);
   giveaways.delete(messageId);
-  endedGiveaways.set(messageId, { entries: gw.entries, prize: gw.prize, winners: gw.winners });
+
+  // Expand pool: each user appears entryCount times
+  const pool = [...gw.entries.entries()].flatMap(([id, count]) => Array(count).fill(id));
+  endedGiveaways.set(messageId, { pool, prize: gw.prize, winners: gw.winners });
 
   const channel = await client.channels.fetch(channelId);
   const msg = await channel.messages.fetch(messageId);
-  const entries = [...gw.entries];
+  const participantCount = gw.entries.size;
 
-  if (entries.length === 0) {
+  if (pool.length === 0) {
     const noWinnerEmbed = new EmbedBuilder()
       .setTitle(`🎉 ${gw.prize}`)
       .setDescription('Giveaway ended!\n\nNo participants entered.')
@@ -68,11 +76,14 @@ async function endGiveaway(messageId, channelId) {
     return;
   }
 
-  const pool = [...entries];
+  const drawPool = [...pool];
   const winners = [];
-  for (let i = 0; i < Math.min(gw.winners, pool.length); i++) {
-    const idx = Math.floor(Math.random() * pool.length);
-    winners.push(pool.splice(idx, 1)[0]);
+  for (let i = 0; i < Math.min(gw.winners, gw.entries.size); i++) {
+    const idx = Math.floor(Math.random() * drawPool.length);
+    const winner = drawPool.splice(idx, 1)[0];
+    winners.push(winner);
+    // Remove all entries for this winner to avoid picking them again
+    drawPool.splice(0, drawPool.length, ...drawPool.filter(id => id !== winner));
   }
 
   const winnerMentions = winners.map(id => `<@${id}>`).join(', ');
@@ -81,7 +92,7 @@ async function endGiveaway(messageId, channelId) {
     .setTitle(`🎉 ${gw.prize}`)
     .setDescription(`Giveaway ended!\n\n**Winner(s):** ${winnerMentions}`)
     .setColor(0x888888)
-    .setFooter({ text: `${entries.length} participant(s)` })
+    .setFooter({ text: `${participantCount} participant(s)` })
     .setTimestamp();
 
   await msg.edit({ embeds: [endedEmbed], components: [] });
@@ -110,13 +121,22 @@ client.on('interactionCreate', async (interaction) => {
       gw.entries.delete(interaction.user.id);
       await interaction.reply({ content: '❌ You left the giveaway.', ephemeral: true });
     } else {
-      gw.entries.add(interaction.user.id);
-      await interaction.reply({ content: '✅ You entered the giveaway! Good luck!', ephemeral: true });
+      // Determine entry count: highest matching bonus role wins, default is 1
+      const member = interaction.member;
+      let entryCount = 1;
+      for (const [roleId, count] of gw.bonusRoles.entries()) {
+        if (member.roles.cache.has(roleId) && count > entryCount) {
+          entryCount = count;
+        }
+      }
+      gw.entries.set(interaction.user.id, entryCount);
+      const bonusMsg = entryCount > 1 ? ` You have **${entryCount}x entries** thanks to your role bonus!` : '';
+      await interaction.reply({ content: `✅ You entered the giveaway! Good luck!${bonusMsg}`, ephemeral: true });
     }
 
     const msg = await interaction.channel.messages.fetch(messageId);
     await msg.edit({
-      embeds: [buildGiveawayEmbed(gw.prize, gw.winners, gw.endTime, gw.entries.size)],
+      embeds: [buildGiveawayEmbed(gw.prize, gw.winners, gw.endTime, gw.entries.size, gw.bonusRoles)],
       components: [buildGiveawayRow(messageId, gw.entries.size)]
     });
   }
@@ -222,25 +242,39 @@ client.on('messageCreate', async (message) => {
   if (message.content.startsWith('+gstart')) {
     if (!isAdmin) return message.reply({ embeds: [modEmbed('❌ No Permission', 'Only Administrators can start giveaways.', 0xff0000)] });
     const args = message.content.split(' ').slice(1);
-    if (args.length < 3) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+gstart <minutes> <winners> <prize>`', 0xff0000)] });
+    if (args.length < 3) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+gstart <minutes> <winners> <prize> [roleID:entries ...]`', 0xff0000)] });
 
     const duration = parseInt(args[0]);
     const winnersCount = parseInt(args[1]);
-    const prize = args.slice(2).join(' ');
 
     if (isNaN(duration) || duration <= 0) return message.reply({ embeds: [modEmbed('❌ Invalid Duration', 'Please provide a valid duration in minutes.', 0xff0000)] });
     if (isNaN(winnersCount) || winnersCount <= 0) return message.reply({ embeds: [modEmbed('❌ Invalid Winners', 'Please provide a valid number of winners.', 0xff0000)] });
 
+    // Parse prize words and bonus role entries (format: roleID:count)
+    const bonusRoles = new Map();
+    const prizeWords = [];
+    for (const word of args.slice(2)) {
+      if (/^\d+:\d+$/.test(word)) {
+        const [roleId, count] = word.split(':');
+        bonusRoles.set(roleId, parseInt(count));
+      } else {
+        prizeWords.push(word);
+      }
+    }
+    const prize = prizeWords.join(' ');
+    if (!prize) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', 'Please provide a prize name.', 0xff0000)] });
+
     const endTime = Date.now() + duration * 60 * 1000;
     const sentMsg = await message.channel.send({
-      embeds: [buildGiveawayEmbed(prize, winnersCount, endTime, 0)],
+      embeds: [buildGiveawayEmbed(prize, winnersCount, endTime, 0, bonusRoles)],
       components: [buildGiveawayRow('placeholder', 0)]
     });
     await sentMsg.edit({ components: [buildGiveawayRow(sentMsg.id, 0)] });
 
     const timer = setTimeout(() => endGiveaway(sentMsg.id, message.channel.id), duration * 60 * 1000);
     giveaways.set(sentMsg.id, {
-      entries: new Set(),
+      entries: new Map(),
+      bonusRoles,
       winners: winnersCount,
       prize,
       endTime,
@@ -248,7 +282,10 @@ client.on('messageCreate', async (message) => {
       timer
     });
 
-    message.reply({ embeds: [modEmbed('✅ Giveaway Started', `**${prize}** — ends in ${duration} minute(s)!\n**Message ID:** \`${sentMsg.id}\``, 0x00cc44)] });
+    const bonusSummary = bonusRoles.size > 0
+      ? '\n' + [...bonusRoles.entries()].map(([r, c]) => `<@&${r}>: ${c}x entries`).join(', ')
+      : '';
+    message.reply({ embeds: [modEmbed('✅ Giveaway Started', `**${prize}** — ends in ${duration} minute(s)!\n**Message ID:** \`${sentMsg.id}\`${bonusSummary}`, 0x00cc44)] });
   }
 
   if (message.content.startsWith('+gend')) {
@@ -266,10 +303,9 @@ client.on('messageCreate', async (message) => {
 
     const gwData = endedGiveaways.get(msgId);
     if (!gwData) return message.reply({ embeds: [modEmbed('❌ Not Found', 'No ended giveaway found with that message ID. Giveaway must have ended via this bot session.', 0xff0000)] });
-    if (gwData.entries.size === 0) return message.reply({ embeds: [modEmbed('❌ No Participants', 'Cannot reroll — no one entered this giveaway.', 0xff0000)] });
+    if (!gwData.pool || gwData.pool.length === 0) return message.reply({ embeds: [modEmbed('❌ No Participants', 'Cannot reroll — no one entered this giveaway.', 0xff0000)] });
 
-    const pool = [...gwData.entries];
-    const winner = pool[Math.floor(Math.random() * pool.length)];
+    const winner = gwData.pool[Math.floor(Math.random() * gwData.pool.length)];
     message.reply({ embeds: [modEmbed('🎉 Rerolled!', `New winner: <@${winner}>! Congratulations, you won **${gwData.prize}**!`, 0xff6600)] });
   }
 });
