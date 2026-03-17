@@ -9,7 +9,7 @@ const client = new Client({
   ]
 });
 
-const CHANNEL_ID = '1482822474449162370';
+const CHANNEL_IDS = ['1482822474449162370', '1472417066442293331'];
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -44,8 +44,10 @@ client.on('messageCreate', async (message) => {
       .setFooter({ text: `Reported by ${message.author.username}` })
       .setTimestamp();
 
-    const channel = await client.channels.fetch(CHANNEL_ID);
-    await channel.send({ embeds: [embed] });
+    await Promise.all(CHANNEL_IDS.map(async (id) => {
+      const channel = await client.channels.fetch(id);
+      await channel.send({ embeds: [embed] });
+    }));
     message.reply('✅ Base reported!');
   }
 });
