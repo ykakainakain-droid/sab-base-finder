@@ -12,6 +12,9 @@ const client = new Client({
 
 const CHANNEL_IDS = ['1482822474449162370', '1472417066442293331'];
 
+const modEmbed = (title, description, color) =>
+  new EmbedBuilder().setTitle(title).setDescription(description).setColor(color).setTimestamp();
+
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
@@ -52,40 +55,64 @@ client.on('messageCreate', async (message) => {
     message.reply('✅ Base reported!');
   }
 
+  const hasModPerms = message.member.permissions.has('Administrator') ||
+                      message.member.permissions.has('ModerateMembers');
+
   if (message.content.startsWith('+ban')) {
-    if (!message.member.permissions.has('BanMembers')) {
-      return message.reply('❌ You do not have permission to ban members.');
+    if (!hasModPerms) {
+      return message.reply({ embeds: [modEmbed('❌ No Permission', 'You need Administrator or Moderate Members permission.', 0xff0000)] });
     }
     const target = message.mentions.members.first();
-    if (!target) return message.reply('❌ Usage: `+ban @user [reason]`');
+    if (!target) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+ban @user [reason]`', 0xff0000)] });
     const reason = message.content.split(' ').slice(2).join(' ') || 'No reason provided';
     await target.ban({ reason });
-    message.reply(`✅ Banned **${target.user.tag}** — Reason: ${reason}`);
+    message.reply({ embeds: [modEmbed('🔨 Member Banned', `**User:** ${target.user.tag}\n**Reason:** ${reason}\n**Moderator:** ${message.author.tag}`, 0xff4444)] });
   }
 
   if (message.content.startsWith('+kick')) {
-    if (!message.member.permissions.has('KickMembers')) {
-      return message.reply('❌ You do not have permission to kick members.');
+    if (!hasModPerms) {
+      return message.reply({ embeds: [modEmbed('❌ No Permission', 'You need Administrator or Moderate Members permission.', 0xff0000)] });
     }
     const target = message.mentions.members.first();
-    if (!target) return message.reply('❌ Usage: `+kick @user [reason]`');
+    if (!target) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+kick @user [reason]`', 0xff0000)] });
     const reason = message.content.split(' ').slice(2).join(' ') || 'No reason provided';
     await target.kick(reason);
-    message.reply(`✅ Kicked **${target.user.tag}** — Reason: ${reason}`);
+    message.reply({ embeds: [modEmbed('👢 Member Kicked', `**User:** ${target.user.tag}\n**Reason:** ${reason}\n**Moderator:** ${message.author.tag}`, 0xff8800)] });
   }
 
   if (message.content.startsWith('+mute')) {
-    if (!message.member.permissions.has('ModerateMembers')) {
-      return message.reply('❌ You do not have permission to mute members.');
+    if (!hasModPerms) {
+      return message.reply({ embeds: [modEmbed('❌ No Permission', 'You need Administrator or Moderate Members permission.', 0xff0000)] });
     }
     const target = message.mentions.members.first();
-    if (!target) return message.reply('❌ Usage: `+mute @user <duration in minutes> [reason]`');
+    if (!target) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+mute @user <minutes> [reason]`', 0xff0000)] });
     const args = message.content.split(' ').slice(2);
     const duration = parseInt(args[0]);
-    if (isNaN(duration) || duration <= 0) return message.reply('❌ Please provide a valid duration in minutes.');
+    if (isNaN(duration) || duration <= 0) return message.reply({ embeds: [modEmbed('❌ Invalid Duration', 'Please provide a valid duration in minutes.', 0xff0000)] });
     const reason = args.slice(1).join(' ') || 'No reason provided';
     await target.timeout(duration * 60 * 1000, reason);
-    message.reply(`✅ Muted **${target.user.tag}** for **${duration} minute(s)** — Reason: ${reason}`);
+    message.reply({ embeds: [modEmbed('🔇 Member Muted', `**User:** ${target.user.tag}\n**Duration:** ${duration} minute(s)\n**Reason:** ${reason}\n**Moderator:** ${message.author.tag}`, 0xffaa00)] });
+  }
+
+  if (message.content.startsWith('+unban')) {
+    if (!hasModPerms) {
+      return message.reply({ embeds: [modEmbed('❌ No Permission', 'You need Administrator or Moderate Members permission.', 0xff0000)] });
+    }
+    const userId = message.content.split(' ')[1];
+    if (!userId) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+unban <user ID> [reason]`', 0xff0000)] });
+    const reason = message.content.split(' ').slice(2).join(' ') || 'No reason provided';
+    await message.guild.members.unban(userId, reason);
+    message.reply({ embeds: [modEmbed('✅ Member Unbanned', `**User ID:** ${userId}\n**Reason:** ${reason}\n**Moderator:** ${message.author.tag}`, 0x00cc44)] });
+  }
+
+  if (message.content.startsWith('+unmute') || message.content.startsWith('+untimeout')) {
+    if (!hasModPerms) {
+      return message.reply({ embeds: [modEmbed('❌ No Permission', 'You need Administrator or Moderate Members permission.', 0xff0000)] });
+    }
+    const target = message.mentions.members.first();
+    if (!target) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+unmute @user` or `+untimeout @user`', 0xff0000)] });
+    await target.timeout(null);
+    message.reply({ embeds: [modEmbed('🔊 Member Unmuted', `**User:** ${target.user.tag}\n**Moderator:** ${message.author.tag}`, 0x00cc44)] });
   }
 });
 
