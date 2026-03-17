@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const http = require('http');
+const fs = require('fs');
 
 const client = new Client({
   intents: [
@@ -16,6 +17,41 @@ const CHANNEL_IDS = ['1482822474449162370', '1472417066442293331'];
 const giveaways = new Map();
 // Ended giveaways (kept for reroll): messageId -> { pool: userId[], prize, winners }
 const endedGiveaways = new Map();
+
+const GIVEAWAYS_FILE = './discord-bot/giveaways.json';
+
+function saveGiveaways() {
+  const data = {};
+  for (const [id, gw] of giveaways.entries()) {
+    data[id] = {
+      entries: [...gw.entries.entries()],
+      bonusRoles: [...gw.bonusRoles.entries()],
+      winners: gw.winners,
+      prize: gw.prize,
+      endTime: gw.endTime,
+      channelId: gw.channelId
+    };
+  }
+  fs.writeFileSync(GIVEAWAYS_FILE, JSON.stringify(data, null, 2));
+}
+
+function loadGiveaways() {
+  if (!fs.existsSync(GIVEAWAYS_FILE)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(GIVEAWAYS_FILE, 'utf8'));
+    for (const [id, gw] of Object.entries(data)) {
+      const remaining = gw.endTime - Date.now();
+      if (remaining <= 0) continue; // already expired
+      const entries = new Map(gw.entries);
+      const bonusRoles = new Map(gw.bonusRoles);
+      const timer = setTimeout(() => endGiveaway(id, gw.channelId), remaining);
+      giveaways.set(id, { entries, bonusRoles, winners: gw.winners, prize: gw.prize, endTime: gw.endTime, channelId: gw.channelId, timer });
+      console.log(`Restored giveaway: ${gw.prize} (${id}), ends in ${Math.ceil(remaining / 1000)}s`);
+    }
+  } catch (e) {
+    console.error('Failed to load giveaways:', e);
+  }
+}
 
 // --- Helpers ---
 
@@ -56,6 +92,7 @@ async function endGiveaway(messageId, channelId) {
 
   clearTimeout(gw.timer);
   giveaways.delete(messageId);
+  saveGiveaways();
 
   // Expand pool: each user appears entryCount times
   const pool = [...gw.entries.entries()].flatMap(([id, count]) => Array(count).fill(id));
@@ -105,6 +142,7 @@ async function endGiveaway(messageId, channelId) {
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
+  loadGiveaways();
 });
 
 // --- Button interactions ---
@@ -134,6 +172,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ content: `✅ You entered the giveaway! Good luck!${bonusMsg}`, ephemeral: true });
     }
 
+    saveGiveaways();
     const msg = await interaction.channel.messages.fetch(messageId);
     await msg.edit({
       embeds: [buildGiveawayEmbed(gw.prize, gw.winners, gw.endTime, gw.entries.size, gw.bonusRoles)],
@@ -281,6 +320,7 @@ client.on('messageCreate', async (message) => {
       channelId: message.channel.id,
       timer
     });
+    saveGiveaways();
 
     const bonusSummary = bonusRoles.size > 0
       ? '\n' + [...bonusRoles.entries()].map(([r, c]) => `<@&${r}>: ${c}x entries`).join(', ')
