@@ -13,26 +13,33 @@ const client = new Client({
 
 const CHANNEL_IDS = ['1482822474449162370', '1472417066442293331'];
 
-// Active giveaways: messageId -> { entries: Map<userId, entryCount>, bonusRoles: Map<roleId, entryCount>, winners, prize, endTime, channelId, timer }
+// In-memory cache: messageId -> giveaway object
+// Source of truth is the Discord thread state message (survives Railway redeploys)
 const giveaways = new Map();
-// Ended giveaways (kept for reroll): messageId -> { pool: userId[], prize, winners }
 const endedGiveaways = new Map();
 
+// JSON file as secondary local cache (survives crash-restarts, not redeploys)
 const GIVEAWAYS_FILE = './discord-bot/giveaways.json';
 
 function saveGiveaways() {
-  const data = {};
-  for (const [id, gw] of giveaways.entries()) {
-    data[id] = {
-      entries: [...gw.entries.entries()],
-      bonusRoles: [...gw.bonusRoles.entries()],
-      winners: gw.winners,
-      prize: gw.prize,
-      endTime: gw.endTime,
-      channelId: gw.channelId
-    };
+  try {
+    const data = {};
+    for (const [id, gw] of giveaways.entries()) {
+      data[id] = {
+        entries: [...gw.entries.entries()],
+        bonusRoles: [...gw.bonusRoles.entries()],
+        winners: gw.winners,
+        prize: gw.prize,
+        endTime: gw.endTime,
+        channelId: gw.channelId,
+        threadId: gw.threadId || null,
+        stateMsgId: gw.stateMsgId || null
+      };
+    }
+    fs.writeFileSync(GIVEAWAYS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('Failed to save giveaways to file:', e);
   }
-  fs.writeFileSync(GIVEAWAYS_FILE, JSON.stringify(data, null, 2));
 }
 
 function loadGiveaways() {
@@ -41,15 +48,82 @@ function loadGiveaways() {
     const data = JSON.parse(fs.readFileSync(GIVEAWAYS_FILE, 'utf8'));
     for (const [id, gw] of Object.entries(data)) {
       const remaining = gw.endTime - Date.now();
-      if (remaining <= 0) continue; // already expired
+      if (remaining <= 0) continue;
       const entries = new Map(gw.entries);
       const bonusRoles = new Map(gw.bonusRoles);
       const timer = setTimeout(() => endGiveaway(id, gw.channelId), remaining);
-      giveaways.set(id, { entries, bonusRoles, winners: gw.winners, prize: gw.prize, endTime: gw.endTime, channelId: gw.channelId, timer });
-      console.log(`Restored giveaway: ${gw.prize} (${id}), ends in ${Math.ceil(remaining / 1000)}s`);
+      giveaways.set(id, {
+        entries, bonusRoles,
+        winners: gw.winners, prize: gw.prize, endTime: gw.endTime,
+        channelId: gw.channelId, threadId: gw.threadId || null,
+        stateMsgId: gw.stateMsgId || null, timer
+      });
+      console.log(`Restored giveaway from file: ${gw.prize} (${id}), ends in ${Math.ceil(remaining / 1000)}s`);
     }
   } catch (e) {
-    console.error('Failed to load giveaways:', e);
+    console.error('Failed to load giveaways from file:', e);
+  }
+}
+
+// Write the current giveaway state to its Discord thread (primary persistent store)
+async function pushStateToThread(gw) {
+  if (!gw.threadId || !gw.stateMsgId) return;
+  try {
+    const thread = await client.channels.fetch(gw.threadId);
+    if (thread.archived) await thread.setArchived(false);
+    const stateMsg = await thread.messages.fetch(gw.stateMsgId);
+    await stateMsg.edit(JSON.stringify({
+      prize: gw.prize, winners: gw.winners,
+      endTime: gw.endTime, channelId: gw.channelId,
+      bonusRoles: [...gw.bonusRoles.entries()],
+      entries: [...gw.entries.entries()],
+      ended: false
+    }));
+  } catch (e) {
+    console.error('Failed to push state to Discord thread:', e);
+  }
+}
+
+// Restore giveaway from its Discord thread after a restart/redeploy
+async function restoreFromThread(messageId, channel) {
+  const gwMsg = await channel.messages.fetch(messageId).catch(() => null);
+  if (!gwMsg) return null;
+
+  const thread = gwMsg.thread;
+  if (!thread) return null;
+
+  try {
+    if (thread.archived) await thread.setArchived(false);
+    const messages = await thread.messages.fetch({ limit: 10 });
+    const stateMsg = messages
+      .filter(m => m.author.id === client.user.id)
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      .first();
+    if (!stateMsg) return null;
+
+    const state = JSON.parse(stateMsg.content);
+    if (state.ended) return 'ended';
+    if (Date.now() > state.endTime) return 'ended';
+
+    const remaining = state.endTime - Date.now();
+    const gw = {
+      entries: new Map(state.entries),
+      bonusRoles: new Map(state.bonusRoles),
+      winners: state.winners,
+      prize: state.prize,
+      endTime: state.endTime,
+      channelId: state.channelId,
+      threadId: thread.id,
+      stateMsgId: stateMsg.id,
+      timer: setTimeout(() => endGiveaway(messageId, state.channelId), remaining)
+    };
+    giveaways.set(messageId, gw);
+    saveGiveaways();
+    console.log(`Restored giveaway from Discord thread: ${gw.prize} (${messageId})`);
+    return gw;
+  } catch (e) {
+    console.error('Failed to parse giveaway state from thread:', e);
+    return null;
   }
 }
 
@@ -94,6 +168,23 @@ async function endGiveaway(messageId, channelId) {
   giveaways.delete(messageId);
   saveGiveaways();
 
+  // Mark state thread as ended
+  if (gw.threadId && gw.stateMsgId) {
+    try {
+      const thread = await client.channels.fetch(gw.threadId);
+      if (thread.archived) await thread.setArchived(false);
+      const stateMsg = await thread.messages.fetch(gw.stateMsgId);
+      await stateMsg.edit(JSON.stringify({
+        prize: gw.prize, winners: gw.winners, endTime: gw.endTime,
+        channelId: gw.channelId, bonusRoles: [...gw.bonusRoles.entries()],
+        entries: [...gw.entries.entries()], ended: true
+      }));
+      await thread.setArchived(true);
+    } catch (e) {
+      console.error('Failed to archive giveaway thread:', e);
+    }
+  }
+
   // Expand pool: each user appears entryCount times
   const pool = [...gw.entries.entries()].flatMap(([id, count]) => Array(count).fill(id));
   endedGiveaways.set(messageId, { pool, prize: gw.prize, winners: gw.winners });
@@ -119,7 +210,6 @@ async function endGiveaway(messageId, channelId) {
     const idx = Math.floor(Math.random() * drawPool.length);
     const winner = drawPool.splice(idx, 1)[0];
     winners.push(winner);
-    // Remove all entries for this winner to avoid picking them again
     drawPool.splice(0, drawPool.length, ...drawPool.filter(id => id !== winner));
   }
 
@@ -152,32 +242,46 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.customId.startsWith('genter_')) {
     const messageId = interaction.customId.replace('genter_', '');
-    const gw = giveaways.get(messageId);
+    let gw = giveaways.get(messageId);
 
+    // Not in memory — try to restore from Discord thread (handles Railway redeploys)
     if (!gw) {
-      const ended = endedGiveaways.has(messageId);
-      return interaction.reply({ flags: 64, content: ended ? '❌ This giveaway has already ended.' : '❌ This giveaway is no longer active.' });
+      try {
+        const result = await restoreFromThread(messageId, interaction.channel);
+        if (result === 'ended' || result === null) {
+          const ended = result === 'ended';
+          return interaction.reply({ flags: 64, content: ended ? '❌ This giveaway has already ended.' : '❌ This giveaway is no longer active.' });
+        }
+        gw = result;
+      } catch (e) {
+        console.error('Error restoring giveaway:', e);
+        return interaction.reply({ flags: 64, content: '❌ This giveaway is no longer active.' });
+      }
     }
 
     if (gw.entries.has(interaction.user.id)) {
       return interaction.reply({ flags: 64, content: '❌ You have already entered this giveaway!' });
-    } else {
-      // Determine entry count: highest matching bonus role wins, default is 1
-      const member = interaction.member;
-      let entryCount = 1;
-      for (const [roleId, count] of gw.bonusRoles.entries()) {
-        if (member.roles.cache.has(roleId) && count > entryCount) {
-          entryCount = count;
-        }
-      }
-      gw.entries.set(interaction.user.id, entryCount);
-      const bonusMsg = entryCount > 1 ? ` You have **${entryCount}x entries** thanks to your role bonus!` : '';
-      await interaction.reply({ flags: 64, content: `✅ You entered the giveaway! Good luck!${bonusMsg}` });
     }
 
+    // Determine entry count: highest matching bonus role wins, default is 1
+    const member = interaction.member;
+    let entryCount = 1;
+    for (const [roleId, count] of gw.bonusRoles.entries()) {
+      if (member.roles.cache.has(roleId) && count > entryCount) {
+        entryCount = count;
+      }
+    }
+    gw.entries.set(interaction.user.id, entryCount);
+
+    const bonusMsg = entryCount > 1 ? ` You have **${entryCount}x entries** thanks to your role bonus!` : '';
+    await interaction.reply({ flags: 64, content: `✅ You entered the giveaway! Good luck!${bonusMsg}` });
+
+    // Persist to both Discord thread and local JSON file
+    await pushStateToThread(gw);
     saveGiveaways();
-    const msg = await interaction.channel.messages.fetch(messageId);
-    await msg.edit({
+
+    const gwMsg = await interaction.channel.messages.fetch(messageId);
+    await gwMsg.edit({
       embeds: [buildGiveawayEmbed(gw.prize, gw.winners, gw.endTime, gw.entries.size, gw.bonusRoles)],
       components: [buildGiveawayRow(messageId, gw.entries.size)]
     });
@@ -292,7 +396,6 @@ client.on('messageCreate', async (message) => {
     if (isNaN(duration) || duration <= 0) return message.reply({ embeds: [modEmbed('❌ Invalid Duration', 'Please provide a valid duration in minutes.', 0xff0000)] });
     if (isNaN(winnersCount) || winnersCount <= 0) return message.reply({ embeds: [modEmbed('❌ Invalid Winners', 'Please provide a valid number of winners.', 0xff0000)] });
 
-    // Parse prize words and bonus role entries (format: roleID:count)
     const bonusRoles = new Map();
     const prizeWords = [];
     for (const word of args.slice(2)) {
@@ -307,10 +410,35 @@ client.on('messageCreate', async (message) => {
     if (!prize) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', 'Please provide a prize name.', 0xff0000)] });
 
     const endTime = Date.now() + duration * 60 * 1000;
+
+    // Send the giveaway message
     const sentMsg = await message.channel.send({
       embeds: [buildGiveawayEmbed(prize, winnersCount, endTime, 0, bonusRoles)],
       components: [buildGiveawayRow('placeholder', 0)]
     });
+
+    // Create a thread on the message to serve as the persistent state store
+    let threadId = null;
+    let stateMsgId = null;
+    try {
+      const thread = await sentMsg.startThread({
+        name: 'giveaway-state',
+        autoArchiveDuration: 10080
+      });
+      const stateMsg = await thread.send(JSON.stringify({
+        prize, winners: winnersCount, endTime,
+        channelId: message.channel.id,
+        bonusRoles: [...bonusRoles.entries()],
+        entries: [],
+        ended: false
+      }));
+      threadId = thread.id;
+      stateMsgId = stateMsg.id;
+    } catch (e) {
+      console.error('Failed to create giveaway state thread:', e);
+    }
+
+    // Update the button customId from placeholder to the real message ID
     await sentMsg.edit({ components: [buildGiveawayRow(sentMsg.id, 0)] });
 
     const timer = setTimeout(() => endGiveaway(sentMsg.id, message.channel.id), duration * 60 * 1000);
@@ -321,6 +449,8 @@ client.on('messageCreate', async (message) => {
       prize,
       endTime,
       channelId: message.channel.id,
+      threadId,
+      stateMsgId,
       timer
     });
     saveGiveaways();
