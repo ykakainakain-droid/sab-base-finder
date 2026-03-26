@@ -12,14 +12,9 @@ const client = new Client({
 });
 
 const CHANNEL_IDS = ['1482822474449162370', '1472417066442293331'];
-
-// In-memory cache: messageId -> giveaway object
-// Source of truth is the Discord thread state message (survives Railway redeploys)
 const giveaways = new Map();
 const endedGiveaways = new Map();
-
-// JSON file as secondary local cache (survives crash-restarts, not redeploys)
-const GIVEAWAYS_FILE = './discord-bot/giveaways.json';
+const GIVEAWAYS_FILE = './giveaways.json';
 
 function saveGiveaways() {
   try {
@@ -31,14 +26,12 @@ function saveGiveaways() {
         winners: gw.winners,
         prize: gw.prize,
         endTime: gw.endTime,
-        channelId: gw.channelId,
-        threadId: gw.threadId || null,
-        stateMsgId: gw.stateMsgId || null
+        channelId: gw.channelId
       };
     }
     fs.writeFileSync(GIVEAWAYS_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
-    console.error('Failed to save giveaways to file:', e);
+    console.error('Failed to save giveaways:', e);
   }
 }
 
@@ -54,80 +47,16 @@ function loadGiveaways() {
       const timer = setTimeout(() => endGiveaway(id, gw.channelId), remaining);
       giveaways.set(id, {
         entries, bonusRoles,
-        winners: gw.winners, prize: gw.prize, endTime: gw.endTime,
-        channelId: gw.channelId, threadId: gw.threadId || null,
-        stateMsgId: gw.stateMsgId || null, timer
+        winners: gw.winners, prize: gw.prize,
+        endTime: gw.endTime, channelId: gw.channelId,
+        timer
       });
-      console.log(`Restored giveaway from file: ${gw.prize} (${id}), ends in ${Math.ceil(remaining / 1000)}s`);
+      console.log(`Restored giveaway: ${gw.prize} (${id})`);
     }
   } catch (e) {
-    console.error('Failed to load giveaways from file:', e);
+    console.error('Failed to load giveaways:', e);
   }
 }
-
-// Write the current giveaway state to its Discord thread (primary persistent store)
-async function pushStateToThread(gw) {
-  if (!gw.threadId || !gw.stateMsgId) return;
-  try {
-    const thread = await client.channels.fetch(gw.threadId);
-    if (thread.archived) await thread.setArchived(false);
-    const stateMsg = await thread.messages.fetch(gw.stateMsgId);
-    await stateMsg.edit(JSON.stringify({
-      prize: gw.prize, winners: gw.winners,
-      endTime: gw.endTime, channelId: gw.channelId,
-      bonusRoles: [...gw.bonusRoles.entries()],
-      entries: [...gw.entries.entries()],
-      ended: false
-    }));
-  } catch (e) {
-    console.error('Failed to push state to Discord thread:', e);
-  }
-}
-
-// Restore giveaway from its Discord thread after a restart/redeploy
-async function restoreFromThread(messageId, channel) {
-  const gwMsg = await channel.messages.fetch(messageId).catch(() => null);
-  if (!gwMsg) return null;
-
-  const thread = gwMsg.thread;
-  if (!thread) return null;
-
-  try {
-    if (thread.archived) await thread.setArchived(false);
-    const messages = await thread.messages.fetch({ limit: 10 });
-    const stateMsg = messages
-      .filter(m => m.author.id === client.user.id)
-      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
-      .first();
-    if (!stateMsg) return null;
-
-    const state = JSON.parse(stateMsg.content);
-    if (state.ended) return 'ended';
-    if (Date.now() > state.endTime) return 'ended';
-
-    const remaining = state.endTime - Date.now();
-    const gw = {
-      entries: new Map(state.entries),
-      bonusRoles: new Map(state.bonusRoles),
-      winners: state.winners,
-      prize: state.prize,
-      endTime: state.endTime,
-      channelId: state.channelId,
-      threadId: thread.id,
-      stateMsgId: stateMsg.id,
-      timer: setTimeout(() => endGiveaway(messageId, state.channelId), remaining)
-    };
-    giveaways.set(messageId, gw);
-    saveGiveaways();
-    console.log(`Restored giveaway from Discord thread: ${gw.prize} (${messageId})`);
-    return gw;
-  } catch (e) {
-    console.error('Failed to parse giveaway state from thread:', e);
-    return null;
-  }
-}
-
-// --- Helpers ---
 
 const modEmbed = (title, description, color) =>
   new EmbedBuilder().setTitle(title).setDescription(description).setColor(color).setTimestamp();
@@ -168,24 +97,6 @@ async function endGiveaway(messageId, channelId) {
   giveaways.delete(messageId);
   saveGiveaways();
 
-  // Mark state thread as ended
-  if (gw.threadId && gw.stateMsgId) {
-    try {
-      const thread = await client.channels.fetch(gw.threadId);
-      if (thread.archived) await thread.setArchived(false);
-      const stateMsg = await thread.messages.fetch(gw.stateMsgId);
-      await stateMsg.edit(JSON.stringify({
-        prize: gw.prize, winners: gw.winners, endTime: gw.endTime,
-        channelId: gw.channelId, bonusRoles: [...gw.bonusRoles.entries()],
-        entries: [...gw.entries.entries()], ended: true
-      }));
-      await thread.setArchived(true);
-    } catch (e) {
-      console.error('Failed to archive giveaway thread:', e);
-    }
-  }
-
-  // Expand pool: each user appears entryCount times
   const pool = [...gw.entries.entries()].flatMap(([id, count]) => Array(count).fill(id));
   endedGiveaways.set(messageId, { pool, prize: gw.prize, winners: gw.winners });
 
@@ -228,42 +139,26 @@ async function endGiveaway(messageId, channelId) {
   });
 }
 
-// --- Ready ---
-
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   loadGiveaways();
 });
-
-// --- Button interactions ---
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
   if (interaction.customId.startsWith('genter_')) {
     const messageId = interaction.customId.replace('genter_', '');
-    let gw = giveaways.get(messageId);
+    const gw = giveaways.get(messageId);
 
-    // Not in memory — try to restore from Discord thread (handles Railway redeploys)
     if (!gw) {
-      try {
-        const result = await restoreFromThread(messageId, interaction.channel);
-        if (result === 'ended' || result === null) {
-          const ended = result === 'ended';
-          return interaction.reply({ flags: 64, content: ended ? '❌ This giveaway has already ended.' : '❌ This giveaway is no longer active.' });
-        }
-        gw = result;
-      } catch (e) {
-        console.error('Error restoring giveaway:', e);
-        return interaction.reply({ flags: 64, content: '❌ This giveaway is no longer active.' });
-      }
+      return interaction.reply({ flags: 64, content: '❌ This giveaway has already ended.' });
     }
 
     if (gw.entries.has(interaction.user.id)) {
       return interaction.reply({ flags: 64, content: '❌ You have already entered this giveaway!' });
     }
 
-    // Determine entry count: highest matching bonus role wins, default is 1
     const member = interaction.member;
     let entryCount = 1;
     for (const [roleId, count] of gw.bonusRoles.entries()) {
@@ -272,13 +167,10 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     gw.entries.set(interaction.user.id, entryCount);
+    saveGiveaways();
 
     const bonusMsg = entryCount > 1 ? ` You have **${entryCount}x entries** thanks to your role bonus!` : '';
     await interaction.reply({ flags: 64, content: `✅ You entered the giveaway! Good luck!${bonusMsg}` });
-
-    // Persist to both Discord thread and local JSON file
-    await pushStateToThread(gw);
-    saveGiveaways();
 
     const gwMsg = await interaction.channel.messages.fetch(messageId);
     await gwMsg.edit({
@@ -288,23 +180,17 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// --- Message commands ---
-
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
   const isAdmin = message.member.permissions.has('Administrator');
   const hasModPerms = isAdmin || message.member.permissions.has('ModerateMembers');
 
-  // ========================
-  // !basefind
-  // ========================
   if (message.content.startsWith('!basefind')) {
     const args = message.content.split(' ').slice(1);
     if (args.length < 3) {
-      return message.reply('❌ Usage: `!basefind <rate> <owner> <unlocktime> <link> <brainrotname>`\n📌 Example: `!basefind 4700000 Heisenberg27 34s https://roblox.com/games/... Skibidi`');
+      return message.reply('❌ Usage: `!basefind <rate> <owner> <unlocktime> <link> <brainrotname>`');
     }
-
     const rate = args[0];
     const owner = args[1];
     const unlock = args[2];
@@ -332,9 +218,6 @@ client.on('messageCreate', async (message) => {
     message.reply('✅ Base reported!');
   }
 
-  // ========================
-  // Moderation
-  // ========================
   if (message.content.startsWith('+ban')) {
     if (!hasModPerms) return message.reply({ embeds: [modEmbed('❌ No Permission', 'You need Administrator or Moderate Members permission.', 0xff0000)] });
     const target = message.mentions.members.first();
@@ -368,7 +251,7 @@ client.on('messageCreate', async (message) => {
   if (message.content.startsWith('+unban')) {
     if (!hasModPerms) return message.reply({ embeds: [modEmbed('❌ No Permission', 'You need Administrator or Moderate Members permission.', 0xff0000)] });
     const userId = message.content.split(' ')[1];
-    if (!userId) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+unban <user ID> [reason]`', 0xff0000)] });
+    if (!userId) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+unban <user ID>`', 0xff0000)] });
     const reason = message.content.split(' ').slice(2).join(' ') || 'No reason provided';
     await message.guild.members.unban(userId, reason);
     message.reply({ embeds: [modEmbed('✅ Member Unbanned', `**User ID:** ${userId}\n**Reason:** ${reason}\n**Moderator:** ${message.author.tag}`, 0x00cc44)] });
@@ -377,14 +260,11 @@ client.on('messageCreate', async (message) => {
   if (message.content.startsWith('+unmute') || message.content.startsWith('+untimeout')) {
     if (!hasModPerms) return message.reply({ embeds: [modEmbed('❌ No Permission', 'You need Administrator or Moderate Members permission.', 0xff0000)] });
     const target = message.mentions.members.first();
-    if (!target) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+unmute @user` or `+untimeout @user`', 0xff0000)] });
+    if (!target) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+unmute @user`', 0xff0000)] });
     await target.timeout(null);
     message.reply({ embeds: [modEmbed('🔊 Member Unmuted', `**User:** ${target.user.tag}\n**Moderator:** ${message.author.tag}`, 0x00cc44)] });
   }
 
-  // ========================
-  // Giveaway
-  // ========================
   if (message.content.startsWith('+gstart')) {
     if (!isAdmin) return message.reply({ embeds: [modEmbed('❌ No Permission', 'Only Administrators can start giveaways.', 0xff0000)] });
     const args = message.content.split(' ').slice(1);
@@ -392,7 +272,6 @@ client.on('messageCreate', async (message) => {
 
     const duration = parseInt(args[0]);
     const winnersCount = parseInt(args[1]);
-
     if (isNaN(duration) || duration <= 0) return message.reply({ embeds: [modEmbed('❌ Invalid Duration', 'Please provide a valid duration in minutes.', 0xff0000)] });
     if (isNaN(winnersCount) || winnersCount <= 0) return message.reply({ embeds: [modEmbed('❌ Invalid Winners', 'Please provide a valid number of winners.', 0xff0000)] });
 
@@ -411,34 +290,11 @@ client.on('messageCreate', async (message) => {
 
     const endTime = Date.now() + duration * 60 * 1000;
 
-    // Send the giveaway message
     const sentMsg = await message.channel.send({
       embeds: [buildGiveawayEmbed(prize, winnersCount, endTime, 0, bonusRoles)],
       components: [buildGiveawayRow('placeholder', 0)]
     });
 
-    // Create a thread on the message to serve as the persistent state store
-    let threadId = null;
-    let stateMsgId = null;
-    try {
-      const thread = await sentMsg.startThread({
-        name: 'giveaway-state',
-        autoArchiveDuration: 10080
-      });
-      const stateMsg = await thread.send(JSON.stringify({
-        prize, winners: winnersCount, endTime,
-        channelId: message.channel.id,
-        bonusRoles: [...bonusRoles.entries()],
-        entries: [],
-        ended: false
-      }));
-      threadId = thread.id;
-      stateMsgId = stateMsg.id;
-    } catch (e) {
-      console.error('Failed to create giveaway state thread:', e);
-    }
-
-    // Update the button customId from placeholder to the real message ID
     await sentMsg.edit({ components: [buildGiveawayRow(sentMsg.id, 0)] });
 
     const timer = setTimeout(() => endGiveaway(sentMsg.id, message.channel.id), duration * 60 * 1000);
@@ -449,8 +305,6 @@ client.on('messageCreate', async (message) => {
       prize,
       endTime,
       channelId: message.channel.id,
-      threadId,
-      stateMsgId,
       timer
     });
     saveGiveaways();
@@ -473,17 +327,13 @@ client.on('messageCreate', async (message) => {
     if (!isAdmin) return message.reply({ embeds: [modEmbed('❌ No Permission', 'Only Administrators can reroll giveaways.', 0xff0000)] });
     const msgId = message.content.split(' ')[1];
     if (!msgId) return message.reply({ embeds: [modEmbed('❌ Invalid Usage', '`+greroll <message_id>`', 0xff0000)] });
-
     const gwData = endedGiveaways.get(msgId);
-    if (!gwData) return message.reply({ embeds: [modEmbed('❌ Not Found', 'No ended giveaway found with that message ID. Giveaway must have ended via this bot session.', 0xff0000)] });
-    if (!gwData.pool || gwData.pool.length === 0) return message.reply({ embeds: [modEmbed('❌ No Participants', 'Cannot reroll — no one entered this giveaway.', 0xff0000)] });
-
+    if (!gwData) return message.reply({ embeds: [modEmbed('❌ Not Found', 'No ended giveaway found with that message ID.', 0xff0000)] });
+    if (!gwData.pool || gwData.pool.length === 0) return message.reply({ embeds: [modEmbed('❌ No Participants', 'Cannot reroll — no one entered.', 0xff0000)] });
     const winner = gwData.pool[Math.floor(Math.random() * gwData.pool.length)];
     message.reply({ embeds: [modEmbed('🎉 Rerolled!', `New winner: <@${winner}>! Congratulations, you won **${gwData.prize}**!`, 0xff6600)] });
   }
 });
-
-// --- HTTP keep-alive server ---
 
 const PORT = process.env.PORT || 8765;
 http.createServer((req, res) => {
